@@ -1,0 +1,31 @@
+# Binaries
+/heat2d_naive
+/heat2d_recompute
+/heat2d_predict
+/heat2d_naive_trace
+/heat2d_naive_waittrace
+
+# Experimental output
+/results/*
+!/results/.gitkeep
+/slurm-*.out
+/control_*.txt
+/trace_*.txt
+/waittrace_*.txt
+/submitted_beta_jobs.txt
+
+# Backups / temporary files
+*.bak
+*.bak_*
+*~
+*.swp
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+
+# Local archives
+*.tar.gz
+*.tgz
+*.zip
