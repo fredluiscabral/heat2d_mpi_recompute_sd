@@ -543,6 +543,10 @@ struct Solver {
     }
 
     bool make_predict_up(int step) {
+        // O predictor precisa de dois halos REAIS anteriores.
+        // step=0 nao possui historico; step=1 possui apenas o halo do step=0.
+        if (step < 2)
+            return false;
         if (pred_step_n1_up != step - 1 || pred_step_n2_up != step - 2)
             return false;
         for (int j = 0; j < nx; ++j)
@@ -551,6 +555,10 @@ struct Solver {
     }
 
     bool make_predict_down(int step) {
+        // O predictor precisa de dois halos REAIS anteriores.
+        // step=0 nao possui historico; step=1 possui apenas o halo do step=0.
+        if (step < 2)
+            return false;
         if (pred_step_n1_down != step - 1 || pred_step_n2_down != step - 2)
             return false;
         for (int j = 0; j < nx; ++j)
