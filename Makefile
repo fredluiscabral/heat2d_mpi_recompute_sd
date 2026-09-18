@@ -3,7 +3,7 @@ CXXFLAGS ?= -O3 -std=c++17 -DNDEBUG
 LDFLAGS ?=
 
 CORE_BINS = heat2d_naive heat2d_recompute heat2d_predict
-DIAG_BINS = heat2d_naive_trace heat2d_naive_waittrace heat2d_predict_multimode
+DIAG_BINS = heat2d_naive_trace heat2d_naive_waittrace heat2d_predict_multimode heat2d_predict_admiss
 BINS = $(CORE_BINS) $(DIAG_BINS)
 
 .PHONY: all core diagnostics clean
@@ -24,6 +24,9 @@ heat2d_predict: heat2d_mpi_predict.cpp heat2d_common_predict.hpp
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 
 heat2d_predict_multimode: heat2d_mpi_predict_multimode.cpp heat2d_common_predict_multimode.hpp
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
+
+heat2d_predict_admiss: heat2d_mpi_predict_admiss.cpp heat2d_common_predict_admiss.hpp
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 
 heat2d_naive_trace: heat2d_mpi_naive_trace.cpp heat2d_common_trace.hpp
