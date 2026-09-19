@@ -268,10 +268,13 @@ struct Stats {
     long long admiss_false_accepts = 0;
     long long admiss_false_rejects = 0;
     long long admiss_unavailable = 0;
-    long long admiss_bound_violations = 0;
+    long long admiss_raw_bound_violations = 0;
+    long long admiss_guarded_bound_violations = 0;
     double admiss_max_est_ratio = 0.0;
     double admiss_max_actual_ratio = 0.0;
-    double admiss_max_bound_ratio = 0.0;
+    double admiss_max_raw_bound_ratio = 0.0;
+    double admiss_max_guarded_bound_ratio = 0.0;
+    double admiss_max_fp_guard = 0.0;
     double admiss_max_real_error_accepted = 0.0;
     double admiss_max_actual_ratio_accepted = 0.0;
 };
@@ -657,10 +660,27 @@ struct Solver {
     struct AdmissEval {
         bool available = false;
         bool accepted = false;
-        std::vector<double> pbound;
+        std::vector<double> pbound_raw;
+        std::vector<double> pbound_safe;
+        std::vector<double> fp_guard;
         std::vector<double> budget;
         double max_est_ratio = 0.0;
+        double max_fp_guard = 0.0;
     };
+
+    // Higham-style gamma_n = n*u/(1-n*u), com u = eps/2 para
+    // arredondamento ao mais proximo em double IEEE-754.
+    static double gamma_n(int n) {
+        const double u = 0.5 * std::numeric_limits<double>::epsilon();
+        const double nu = static_cast<double>(n) * u;
+        return nu / (1.0 - nu);
+    }
+
+    static double q_round_guard(double a, double b, double c) {
+        // q = a - 2b + c. A multiplicacao por 2 e exata em binario
+        // (sem overflow/subnormal); restam duas operacoes arredondadas.
+        return gamma_n(2) * (std::abs(a) + 2.0 * std::abs(b) + std::abs(c));
+    }
 
     RemoteSlot* slot_at_step(int step) {
         if (step < 0) return nullptr;
@@ -736,6 +756,81 @@ struct Solver {
              + sb[static_cast<std::size_t>(j - 1)]
              + sb[static_cast<std::size_t>(j + 1)]
              - 4.0 * sb[k];
+    }
+
+    double fp_guard_point(const RemoteSlot& s0,
+                          const RemoteSlot& s1,
+                          const RemoteSlot& s2,
+                          bool up,
+                          int j,
+                          double c0,
+                          double qB,
+                          double qI,
+                          double qE,
+                          double qL,
+                          double qR,
+                          double Phat_raw) const {
+        // 1) Incerteza de arredondamento nas cinco segundas diferencas Q.
+        const double qb_g = q_round_guard(
+            boundary_with_ghost(s0, up, true, j),
+            boundary_with_ghost(s1, up, true, j),
+            boundary_with_ghost(s2, up, true, j));
+
+        const auto& rs0 = remote_support(s0, up);
+        const auto& rs1 = remote_support(s1, up);
+        const auto& rs2 = remote_support(s2, up);
+        const std::size_t sk = static_cast<std::size_t>(j + 1);
+        const double qi_g = q_round_guard(rs0[sk], rs1[sk], rs2[sk]);
+
+        const double qe_g = q_round_guard(
+            boundary_with_ghost(s0, up, false, j),
+            boundary_with_ghost(s1, up, false, j),
+            boundary_with_ghost(s2, up, false, j));
+
+        const double ql_g = q_round_guard(
+            boundary_with_ghost(s0, up, true, j - 1),
+            boundary_with_ghost(s1, up, true, j - 1),
+            boundary_with_ghost(s2, up, true, j - 1));
+
+        const double qr_g = q_round_guard(
+            boundary_with_ghost(s0, up, true, j + 1),
+            boundary_with_ghost(s1, up, true, j + 1),
+            boundary_with_ghost(s2, up, true, j + 1));
+
+        const double q_guard =
+            std::abs(c0) * qb_g
+            + ry * (qi_g + qe_g)
+            + rx * (ql_g + qr_g);
+
+        // 2) Arredondamento ao combinar os termos nao-negativos de P_hat.
+        // Ha cinco multiplicacoes por coeficientes e quatro somas.
+        const double combine_guard =
+            gamma_n(9) * (std::abs(Phat_raw) + q_guard);
+
+        // 3) Arredondamento da extrapolacao 2*n1-n2.
+        const double n1 = boundary_with_ghost(s0, up, true, j);
+        const double n2 = boundary_with_ghost(s1, up, true, j);
+        const double predict_guard =
+            gamma_n(1) * (2.0 * std::abs(n1) + std::abs(n2));
+
+        // 4) Arredondamento de uma atualizacao FTCS da fronteira remota.
+        // Escala absoluta da expressao
+        // c + rx(l-2c+r) + ry(deep-2c+own).
+        const double c = boundary_with_ghost(s0, up, true, j);
+        const double l = boundary_with_ghost(s0, up, true, j - 1);
+        const double r = boundary_with_ghost(s0, up, true, j + 1);
+        const double deep = rs0[sk];
+        const double own = boundary_with_ghost(s0, up, false, j);
+        const double update_scale =
+            std::abs(c)
+            + rx * (std::abs(l) + 2.0 * std::abs(c) + std::abs(r))
+            + ry * (std::abs(deep) + 2.0 * std::abs(c) + std::abs(own));
+
+        // Duas diferencas, duas somas internas, dois produtos por r,
+        // e duas somas finais: oito operacoes arredondadas.
+        const double update_guard = gamma_n(8) * update_scale;
+
+        return q_guard + combine_guard + predict_guard + update_guard;
     }
 
     double runtime_budget_point(const RemoteSlot& s0,
@@ -816,7 +911,9 @@ struct Solver {
             !support_ready(*s2, up))
             return out;
 
-        out.pbound.assign(static_cast<std::size_t>(nx), 0.0);
+        out.pbound_raw.assign(static_cast<std::size_t>(nx), 0.0);
+        out.pbound_safe.assign(static_cast<std::size_t>(nx), 0.0);
+        out.fp_guard.assign(static_cast<std::size_t>(nx), 0.0);
         out.budget.assign(static_cast<std::size_t>(nx), 0.0);
         out.available = true;
         out.accepted = true;
@@ -832,21 +929,33 @@ struct Solver {
 
             // Nesta variante PREDICT nunca altera a solucao, portanto
             // D^(n-1)=D^(n-2)=0: testamos uma predicao isolada.
-            const double Phat =
+            const double Phat_raw =
                 std::abs(c0) * std::abs(qB)
                 + ry * (std::abs(qI) + std::abs(qE))
                 + rx * (std::abs(qL) + std::abs(qR));
 
+            // O bound analitico acima vale em aritmetica exata. Para nao
+            // classificar ruido de ponto flutuante como falha numerica,
+            // acrescentamos um guard derivado do modelo padrao de erro
+            // de arredondamento (gamma_n), calculavel ANTES do halo atual.
+            const double fp_guard =
+                fp_guard_point(*s0, *s1, *s2, up, j,
+                               c0, qB, qI, qE, qL, qR, Phat_raw);
+            const double Phat_safe = Phat_raw + fp_guard;
+
             const double B = runtime_budget_point(*s0, *s1, *s2, up, j);
             const double allowed = cfg.eta * B;
-            const double Esync_hat = ry * Phat;
+            const double Esync_hat = ry * Phat_safe;
             const double ratio = (allowed > 0.0)
                 ? Esync_hat / allowed
                 : std::numeric_limits<double>::infinity();
 
-            out.pbound[static_cast<std::size_t>(j)] = Phat;
+            out.pbound_raw[static_cast<std::size_t>(j)] = Phat_raw;
+            out.pbound_safe[static_cast<std::size_t>(j)] = Phat_safe;
+            out.fp_guard[static_cast<std::size_t>(j)] = fp_guard;
             out.budget[static_cast<std::size_t>(j)] = B;
             out.max_est_ratio = std::max(out.max_est_ratio, ratio);
+            out.max_fp_guard = std::max(out.max_fp_guard, fp_guard);
 
             if (!(Esync_hat <= allowed)) out.accepted = false;
         }
@@ -863,11 +972,15 @@ struct Solver {
         if (ev.accepted) stats.admiss_accepted++;
         stats.admiss_max_est_ratio =
             std::max(stats.admiss_max_est_ratio, ev.max_est_ratio);
+        stats.admiss_max_fp_guard =
+            std::max(stats.admiss_max_fp_guard, ev.max_fp_guard);
 
         bool actual_safe = true;
-        bool bound_violation = false;
+        bool raw_bound_violation = false;
+        bool guarded_bound_violation = false;
         double max_actual_ratio = 0.0;
-        double max_bound_ratio = 0.0;
+        double max_raw_bound_ratio = 0.0;
+        double max_guarded_bound_ratio = 0.0;
         double max_real_error = 0.0;
 
         for (int j = 0; j < nx; ++j) {
@@ -881,29 +994,44 @@ struct Solver {
             max_real_error = std::max(max_real_error, actual);
             max_actual_ratio = std::max(max_actual_ratio, actual_ratio);
 
-            const double pb = ev.pbound[k];
-            double bratio = 0.0;
-            if (pb > 0.0) bratio = actual / pb;
-            else if (actual > 0.0) bratio = std::numeric_limits<double>::infinity();
-            max_bound_ratio = std::max(max_bound_ratio, bratio);
+            const double raw = ev.pbound_raw[k];
+            const double safe = ev.pbound_safe[k];
+
+            double raw_ratio = 0.0;
+            if (raw > 0.0) raw_ratio = actual / raw;
+            else if (actual > 0.0) raw_ratio = std::numeric_limits<double>::infinity();
+
+            double safe_ratio = 0.0;
+            if (safe > 0.0) safe_ratio = actual / safe;
+            else if (actual > 0.0) safe_ratio = std::numeric_limits<double>::infinity();
+
+            max_raw_bound_ratio = std::max(max_raw_bound_ratio, raw_ratio);
+            max_guarded_bound_ratio = std::max(max_guarded_bound_ratio, safe_ratio);
 
             if (!(ry * actual <= allowed)) actual_safe = false;
 
-            const double round_tol =
-                8.0 * std::numeric_limits<double>::epsilon()
-                * (1.0 + std::abs(predicted[k]) + std::abs(real[k]));
-            if (actual > pb + round_tol) bound_violation = true;
+            // A comparacao de validacao tambem e feita em double; damos apenas
+            // uma margem de uma operacao de subtracao para evitar um artefato
+            // da propria medicao. O guard principal ja esta em pbound_safe.
+            const double validation_tol =
+                gamma_n(1) * (std::abs(predicted[k]) + std::abs(real[k]));
+
+            if (actual > raw + validation_tol) raw_bound_violation = true;
+            if (actual > safe + validation_tol) guarded_bound_violation = true;
         }
 
         if (actual_safe) stats.admiss_actual_safe++;
         if (ev.accepted && !actual_safe) stats.admiss_false_accepts++;
         if (!ev.accepted && actual_safe) stats.admiss_false_rejects++;
-        if (bound_violation) stats.admiss_bound_violations++;
+        if (raw_bound_violation) stats.admiss_raw_bound_violations++;
+        if (guarded_bound_violation) stats.admiss_guarded_bound_violations++;
 
         stats.admiss_max_actual_ratio =
             std::max(stats.admiss_max_actual_ratio, max_actual_ratio);
-        stats.admiss_max_bound_ratio =
-            std::max(stats.admiss_max_bound_ratio, max_bound_ratio);
+        stats.admiss_max_raw_bound_ratio =
+            std::max(stats.admiss_max_raw_bound_ratio, max_raw_bound_ratio);
+        stats.admiss_max_guarded_bound_ratio =
+            std::max(stats.admiss_max_guarded_bound_ratio, max_guarded_bound_ratio);
 
         if (ev.accepted) {
             stats.admiss_max_real_error_accepted =
@@ -1039,7 +1167,8 @@ struct Solver {
                       << " policy=" << (adaptive?cfg.policy:"wait")
                       << " eta=" << cfg.eta
                       << " kappa=" << cfg.kappa
-                      << " budget_floor=" << cfg.budget_floor << "\n";
+                      << " budget_floor=" << cfg.budget_floor
+                      << " fp_guard=higham_gamma" << "\n";
         }
 
         MPI_Barrier(world);
@@ -1130,28 +1259,31 @@ struct Solver {
         MPI_Reduce(&stats.predict_linf_max, &global_predict_linf_max, 1,
                    MPI_DOUBLE, MPI_MAX, 0, world);
 
-        long long loc_admiss[7] = {
+        long long loc_admiss[8] = {
             stats.admiss_tests,
             stats.admiss_accepted,
             stats.admiss_actual_safe,
             stats.admiss_false_accepts,
             stats.admiss_false_rejects,
             stats.admiss_unavailable,
-            stats.admiss_bound_violations
+            stats.admiss_raw_bound_violations,
+            stats.admiss_guarded_bound_violations
         };
-        long long glob_admiss[7] = {0,0,0,0,0,0,0};
-        MPI_Reduce(loc_admiss, glob_admiss, 7,
+        long long glob_admiss[8] = {0,0,0,0,0,0,0,0};
+        MPI_Reduce(loc_admiss, glob_admiss, 8,
                    MPI_LONG_LONG_INT, MPI_SUM, 0, world);
 
-        double loc_admiss_max[5] = {
+        double loc_admiss_max[7] = {
             stats.admiss_max_est_ratio,
             stats.admiss_max_actual_ratio,
-            stats.admiss_max_bound_ratio,
+            stats.admiss_max_raw_bound_ratio,
+            stats.admiss_max_guarded_bound_ratio,
+            stats.admiss_max_fp_guard,
             stats.admiss_max_real_error_accepted,
             stats.admiss_max_actual_ratio_accepted
         };
-        double glob_admiss_max[5] = {0,0,0,0,0};
-        MPI_Reduce(loc_admiss_max, glob_admiss_max, 5,
+        double glob_admiss_max[7] = {0,0,0,0,0,0,0};
+        MPI_Reduce(loc_admiss_max, glob_admiss_max, 7,
                    MPI_DOUBLE, MPI_MAX, 0, world);
 
         // ------------------------------------------------------------
@@ -1270,13 +1402,17 @@ struct Solver {
                       << " false_accepts=" << glob_admiss[3]
                       << " false_rejects=" << glob_admiss[4]
                       << " unavailable=" << glob_admiss[5]
-                      << " bound_violations=" << glob_admiss[6]
+                      << " raw_bound_violations=" << glob_admiss[6]
+                      << " guarded_bound_violations=" << glob_admiss[7]
                       << " max_est_ratio=" << glob_admiss_max[0]
                       << " max_actual_ratio=" << glob_admiss_max[1]
-                      << " max_actual_over_bound=" << glob_admiss_max[2]
-                      << " max_real_error_accepted=" << glob_admiss_max[3]
-                      << " max_actual_ratio_accepted=" << glob_admiss_max[4]
+                      << " max_actual_over_raw_bound=" << glob_admiss_max[2]
+                      << " max_actual_over_guarded_bound=" << glob_admiss_max[3]
+                      << " max_fp_guard=" << glob_admiss_max[4]
+                      << " max_real_error_accepted=" << glob_admiss_max[5]
+                      << " max_actual_ratio_accepted=" << glob_admiss_max[6]
                       << " assumed_D=0"
+                      << " fp_guard=higham_gamma"
                       << "\n";
 
             std::cout << std::setprecision(12)
