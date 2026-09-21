@@ -2,7 +2,7 @@ CXX = mpicxx
 CXXFLAGS ?= -O3 -std=c++17 -DNDEBUG
 LDFLAGS ?=
 
-CORE_BINS = heat2d_naive heat2d_recompute heat2d_predict
+CORE_BINS = heat2d_naive heat2d_recompute heat2d_predict heat2d_predict_operational
 DIAG_BINS = heat2d_naive_trace heat2d_naive_waittrace heat2d_predict_multimode heat2d_predict_admiss
 BINS = $(CORE_BINS) $(DIAG_BINS)
 
@@ -21,6 +21,9 @@ heat2d_recompute: heat2d_mpi_recompute.cpp heat2d_common.hpp
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 
 heat2d_predict: heat2d_mpi_predict.cpp heat2d_common_predict.hpp
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
+
+heat2d_predict_operational: heat2d_mpi_predict_operational.cpp heat2d_common_predict_operational.hpp
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 
 heat2d_predict_multimode: heat2d_mpi_predict_multimode.cpp heat2d_common_predict_multimode.hpp
